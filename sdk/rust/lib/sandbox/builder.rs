@@ -144,6 +144,9 @@ impl SandboxBuilder {
 
     /// Overlay sparse sandbox configuration on the hardcoded and global defaults.
     pub fn overlay(mut self, patch: SandboxConfigPatch) -> Self {
+        if let ConfigSource::ExistingConfig(existing) = &mut self.config_source {
+            existing.overlay_mut(patch.clone());
+        }
         self.config.overlay_mut(patch);
         self
     }
@@ -275,7 +278,19 @@ impl SandboxBuilder {
                 return self;
             }
         };
-        let mut image = self.config.spec.image.clone().unwrap_or_default();
+        let mut image = self
+            .config
+            .spec
+            .image
+            .clone()
+            .or_else(|| {
+                if let ConfigSource::ExistingConfig(existing) = &self.config_source {
+                    existing.spec.image.clone()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default();
         match &mut image {
             RootfsSource::Oci(oci) if !oci.reference.is_empty() => {
                 oci.root_disk = Some(root_disk);
@@ -308,7 +323,11 @@ impl SandboxBuilder {
     /// Allocate virtual CPUs for this sandbox (default: 1).
     pub fn cpus(mut self, count: u8) -> Self {
         let resources = &mut self.config.spec.resources;
-        if resources.max_cpus.is_some_and(|max| max < count) {
+        let max_cpus = resources.max_cpus.or(match &self.config_source {
+            ConfigSource::ExistingConfig(existing) => existing.spec.resources.max_cpus,
+            _ => None,
+        });
+        if max_cpus.is_some_and(|max| max < count) {
             resources.max_cpus = Some(count);
         }
         resources.cpus = Some(count);
@@ -348,7 +367,11 @@ impl SandboxBuilder {
     pub fn memory(mut self, size: impl Into<Mebibytes>) -> Self {
         let memory_mib = size.into().as_u32();
         let resources = &mut self.config.spec.resources;
-        if resources.max_memory_mib.is_some_and(|max| max < memory_mib) {
+        let max_memory_mib = resources.max_memory_mib.or(match &self.config_source {
+            ConfigSource::ExistingConfig(existing) => existing.spec.resources.max_memory_mib,
+            _ => None,
+        });
+        if max_memory_mib.is_some_and(|max| max < memory_mib) {
             resources.max_memory_mib = Some(memory_mib);
         }
         resources.memory_mib = Some(memory_mib);
@@ -590,13 +613,8 @@ impl SandboxBuilder {
     /// `init` and `entrypoint` are orthogonal: `init` is the guest's
     /// PID 1; `entrypoint` is the user workload that agentd exec's
     /// per request. They can be combined freely.
-    pub fn init(mut self, cmd: impl Into<String>) -> Self {
-        self.config.spec.init = Some(HandoffInit {
-            cmd: cmd.into(),
-            args: Vec::new(),
-            env: Vec::new(),
-        });
-        self
+    pub fn init(self, cmd: impl Into<String>) -> Self {
+        self.init_with(cmd, |init| init)
     }
 
     /// Hand off PID 1 with a closure-builder for argv and env. Use this
@@ -619,11 +637,15 @@ impl SandboxBuilder {
         f: impl FnOnce(InitOptionsBuilder) -> InitOptionsBuilder,
     ) -> Self {
         let (args, env) = f(InitOptionsBuilder::default()).build();
-        self.config.spec.init = Some(HandoffInit {
+        let init = HandoffInit {
             cmd: cmd.into(),
             args,
             env,
-        });
+        };
+        if let ConfigSource::ExistingConfig(existing) = &mut self.config_source {
+            existing.spec.init = Some(init.clone());
+        }
+        self.config.spec.init = Some(init);
         self
     }
 
@@ -1002,7 +1024,13 @@ impl SandboxBuilder {
             }
             return self;
         }
-        self.config.spec.get_env_mut().push(EnvVar::new(key, value));
+
+        let value = EnvVar::new(key, value);
+        if let ConfigSource::ExistingConfig(existing) = &mut self.config_source {
+            existing.spec.get_env_mut().push(value.clone());
+        }
+
+        self.config.spec.get_env_mut().push(value);
         self
     }
 
@@ -1199,6 +1227,15 @@ impl SandboxBuilder {
         self
     }
 
+    /// Keep the resolved environment and init instead of replaying their original inputs.
+    /// Their setters and `overlay` apply new edits directly to the existing config.
+    fn rebuild_overrides(&self) -> SandboxConfigPatch {
+        let mut overrides = self.config.clone();
+        overrides.spec.clear_env_mut();
+        overrides.spec.init = None;
+        overrides
+    }
+
     /// Start an additive edit from the existing list unless the caller already replaced it.
     fn list_for_append<T: Clone>(
         &mut self,
@@ -1362,7 +1399,7 @@ impl SandboxBuilder {
             // Inspection started from the caller's options and may have replaced captured
             // state. Do not overlay the old concrete values back onto that result.
             if rebuilt {
-                prepared.overlay_mut(self.config.clone());
+                prepared.overlay_mut(self.rebuild_overrides());
             } else {
                 prepared.spec.resources = self.config.spec.resources.clone();
                 prepared.spec.deployment_profile = self.config.spec.deployment_profile;
@@ -1474,8 +1511,11 @@ impl SandboxBuilder {
         self.capture_host_paths(backend.as_ref())?;
         self.resolve_pending(backend).await?;
 
-        if let ConfigSource::ExistingConfig(prepared) = &mut self.config_source {
-            prepared.overlay_mut(self.config.clone());
+        if matches!(self.config_source, ConfigSource::ExistingConfig(_)) {
+            let overrides = self.rebuild_overrides();
+            if let ConfigSource::ExistingConfig(prepared) = &mut self.config_source {
+                prepared.overlay_mut(overrides);
+            }
         }
 
         Ok(match &mut self.config_source {
@@ -1539,7 +1579,7 @@ impl SandboxBuilder {
 
         let input = match &self.config_source {
             ConfigSource::ExistingConfig(resolved) => {
-                (**resolved).clone().overlay(self.config.clone())
+                (**resolved).clone().overlay(self.rebuild_overrides())
             }
             _ => self.config.clone(),
         };
@@ -2515,6 +2555,230 @@ mod tests {
     use crate::sandbox::{MAX_HOSTNAME_BYTES, MAX_SANDBOX_NAME_BYTES, RlimitResource};
     use crate::{LogLevel, MicrosandboxError, MicrosandboxResult, RestoreKind};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn rebuild_preserves_resolved_init_and_honors_new_init_edits() {
+        let image = microsandbox_image::ImageConfig {
+            env: vec!["PATH=/usr/bin".into()],
+            entrypoint: Some(vec!["/lib/systemd/systemd".into()]),
+            ..Default::default()
+        };
+        let original = SandboxBuilder::new("init-rebuild")
+            .image("alpine")
+            .init_with("auto", |i| i.args(["--system"]))
+            .finish(None, Some(SandboxConfigPatch::from_image(&image)))
+            .unwrap();
+        let json = serde_json::to_string(&original).unwrap();
+        let saved = original.caller_config_overrides_json(&json).unwrap();
+
+        for saved in [None, saved.as_deref()] {
+            let loaded = SandboxConfig::from_stored(&json, saved).unwrap();
+            let rebuilt = SandboxBuilder::from(loaded.clone())
+                .finish(None, None)
+                .unwrap();
+            let init = rebuilt.spec.init.unwrap();
+            assert_eq!(init.cmd, "/lib/systemd/systemd");
+            assert_eq!(init.args, vec!["--system"]);
+            assert_eq!(init.env, vec![("PATH".into(), "/usr/bin".into())]);
+
+            for builder in [
+                SandboxBuilder::from(loaded.clone()).init("/sbin/init"),
+                SandboxBuilder::from(loaded.clone())
+                    .init_with("/sbin/init", |i| i.args(["--custom"])),
+                SandboxBuilder::from(loaded.clone()).overlay(SandboxConfigPatch::new().spec(
+                    SandboxSpecPatch::new().init(microsandbox_types::HandoffInit {
+                        cmd: "/sbin/init".into(),
+                        args: vec![],
+                        env: vec![],
+                    }),
+                )),
+            ] {
+                let edited = builder.finish(None, None).unwrap();
+                assert_eq!(edited.spec.init.as_ref().unwrap().cmd, "/sbin/init");
+                assert_eq!(
+                    serde_json::to_value(
+                        &edited.caller_config_overrides.as_ref().unwrap().spec.init
+                    )
+                    .unwrap(),
+                    serde_json::to_value(&edited.spec.init).unwrap()
+                );
+                let rebuilt = SandboxBuilder::from(edited.clone())
+                    .finish(None, None)
+                    .unwrap();
+                assert_eq!(
+                    serde_json::to_value(&rebuilt.spec.init).unwrap(),
+                    serde_json::to_value(&edited.spec.init).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rebuild_resource_growth_raises_only_insufficient_maxima() {
+        for explicit_max in [false, true] {
+            let mut builder = SandboxBuilder::new("resource-rebuild")
+                .image("alpine")
+                .cpus(2)
+                .memory(512u32);
+            if explicit_max {
+                builder = builder.max_cpus(8).max_memory(2048u32);
+            }
+            let original = builder.finish(None, None).unwrap();
+            let json = serde_json::to_string(&original).unwrap();
+            let saved = original.caller_config_overrides_json(&json).unwrap();
+
+            for saved in [None, saved.as_deref()] {
+                let loaded = SandboxConfig::from_stored(&json, saved).unwrap();
+                let config = SandboxBuilder::from(loaded.clone())
+                    .cpus(4)
+                    .memory(1024u32)
+                    .finish(None, None)
+                    .unwrap();
+                assert_eq!(config.spec.resources.cpus, 4);
+                assert_eq!(config.spec.resources.memory_mib, 1024);
+                assert_eq!(
+                    config.spec.resources.max_cpus,
+                    if explicit_max { 8 } else { 4 }
+                );
+                assert_eq!(
+                    config.spec.resources.max_memory_mib,
+                    if explicit_max { 2048 } else { 1024 }
+                );
+
+                let mut checkpoint = loaded.clone();
+                checkpoint.restore_resources.geometry =
+                    Some(microsandbox_image::checkpoint::CheckpointGeometry {
+                        vcpus: 2,
+                        max_vcpus: original.spec.resources.max_cpus,
+                        memory_mib: 512,
+                        max_memory_mib: original.spec.resources.max_memory_mib,
+                    });
+                for builder in [
+                    SandboxBuilder::from(checkpoint.clone()).cpus(4),
+                    SandboxBuilder::from(checkpoint).memory(1024u32),
+                ] {
+                    let error = builder.finish(None, None).unwrap_err();
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("captured CPU and memory geometry")
+                    );
+                }
+
+                let invalid = SandboxBuilder::from(loaded)
+                    .cpus(4)
+                    .max_cpus(2)
+                    .finish(None, None);
+                assert!(invalid.unwrap_err().to_string().contains("max_cpus"));
+            }
+        }
+    }
+
+    #[test]
+    fn rebuild_root_disk_uses_existing_image_unless_replaced() {
+        let original = SandboxBuilder::new("disk-rebuild")
+            .image("alpine")
+            .finish(None, None)
+            .unwrap();
+        let json = serde_json::to_string(&original).unwrap();
+        let loaded = SandboxConfig::from_stored(&json, None).unwrap();
+        let config = SandboxBuilder::from(loaded.clone())
+            .root_disk(8192u32)
+            .finish(None, None)
+            .unwrap();
+        assert_eq!(config.spec.image.oci_reference(), Some("alpine"));
+        assert_eq!(
+            config.spec.image.oci_root_disk(),
+            Some(&crate::sandbox::RootDisk::Managed {
+                size_mib: Some(8192)
+            })
+        );
+
+        let replaced = SandboxBuilder::from(loaded.clone())
+            .image("ubuntu")
+            .root_disk(4096u32)
+            .finish(None, None)
+            .unwrap();
+        assert_eq!(replaced.spec.image.oci_reference(), Some("ubuntu"));
+        let invalid = SandboxBuilder::from(loaded)
+            .image("/tmp/rootfs")
+            .root_disk(4096u32)
+            .finish(None, None);
+        assert!(
+            invalid
+                .unwrap_err()
+                .to_string()
+                .contains("only valid for OCI images")
+        );
+    }
+
+    #[test]
+    fn rebuild_preserves_image_env_and_honors_new_env_edits() {
+        use microsandbox_types::EnvVar;
+
+        for caller_env in [false, true] {
+            let image = SandboxConfigPatch::new().spec(SandboxSpecPatch::new().replace_env(vec![
+                EnvVar::new("PATH", "/usr/bin"),
+                EnvVar::new("IMAGE_ONLY", "inherited"),
+            ]));
+            let mut builder = SandboxBuilder::new("env-rebuild").image("alpine");
+            if caller_env {
+                builder = builder.env("APP", "first").env("APP", "last");
+            }
+            let original = builder.finish(None, Some(image)).unwrap();
+            let json = serde_json::to_string(&original).unwrap();
+            let saved = original.caller_config_overrides_json(&json).unwrap();
+            let loaded = SandboxConfig::from_stored(&json, saved.as_deref()).unwrap();
+
+            let rebuilt = SandboxBuilder::from(loaded.clone())
+                .finish(None, None)
+                .unwrap();
+            assert_eq!(rebuilt.spec.env, original.spec.env);
+            assert_eq!(
+                rebuilt
+                    .caller_config_overrides
+                    .as_ref()
+                    .unwrap()
+                    .spec
+                    .get_env(),
+                original
+                    .caller_config_overrides
+                    .as_ref()
+                    .unwrap()
+                    .spec
+                    .get_env()
+            );
+
+            let appended = SandboxBuilder::from(loaded.clone())
+                .env("NEW", "value")
+                .finish(None, None)
+                .unwrap();
+            let mut expected = original.spec.env.clone();
+            expected.push(EnvVar::new("NEW", "value"));
+            assert_eq!(appended.spec.env, expected);
+
+            let merged =
+                SandboxBuilder::from(loaded.clone())
+                    .overlay(SandboxConfigPatch::new().spec(
+                        SandboxSpecPatch::new().env(vec![EnvVar::new("PATH", "/custom/bin")]),
+                    ))
+                    .finish(None, None)
+                    .unwrap();
+            expected = original.spec.env.clone();
+            expected[0] = EnvVar::new("PATH", "/custom/bin");
+            assert_eq!(merged.spec.env, expected);
+
+            let cleared = SandboxBuilder::from(loaded)
+                .overlay(
+                    SandboxConfigPatch::new().spec(SandboxSpecPatch::new().replace_env(Vec::new())),
+                )
+                .finish(None, None)
+                .unwrap();
+            assert!(cleared.spec.env.is_empty());
+            let rebuilt_clear = SandboxBuilder::from(cleared).finish(None, None).unwrap();
+            assert!(rebuilt_clear.spec.env.is_empty());
+        }
+    }
 
     #[test]
     fn additive_setters_preserve_existing_config_lists() {
