@@ -186,6 +186,7 @@ impl LocalBackend {
             }
         }
 
+        super::creation::require_complete(write_db, model.id, name).await?;
         let mut config: SandboxConfig = serde_json::from_str::<SandboxConfig>(&model.config)?;
         // Also cover starts after crashes or a stop performed by an older SDK. Lifecycle
         // ownership alone can become available during Linux's deferred disk/KVM teardown.
