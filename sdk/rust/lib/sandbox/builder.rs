@@ -1341,7 +1341,7 @@ impl SandboxBuilder {
         backend_config: Option<&BackendConfig>,
         image_defaults: Option<SandboxConfigPatch>,
     ) -> MicrosandboxResult<SandboxConfig> {
-        self.finish_config(SandboxConfig::default(), backend_config, image_defaults)
+        self.finish_config(backend_config, image_defaults, |_| {})
     }
 
     /// Merge built-in local defaults below image, backend, and caller settings.
@@ -1356,7 +1356,7 @@ impl SandboxBuilder {
         ))
         .overlay(image_defaults.unwrap_or_default());
 
-        self.finish_config(SandboxConfig::default(), Some(backend_config), Some(base))
+        self.finish_config(Some(backend_config), Some(base), |_| {})
     }
 
     #[cfg(feature = "cloud")]
@@ -1364,14 +1364,24 @@ impl SandboxBuilder {
         self,
         backend_config: &BackendConfig,
     ) -> MicrosandboxResult<SandboxConfig> {
-        self.finish_config(SandboxConfig::default(), Some(backend_config), None)
+        self.finish_config(Some(backend_config), None, |options| {
+            // Cloud has no separate hotplug capacity. Clear equal maxima after
+            // replaying saved choices so they follow managed CPU and memory sizes.
+            let resources = &mut options.spec.resources;
+            if resources.max_cpus == resources.cpus {
+                resources.max_cpus = None;
+            }
+            if resources.max_memory_mib == resources.memory_mib {
+                resources.max_memory_mib = None;
+            }
+        })
     }
 
     fn finish_config(
         mut self,
-        mut sandbox: SandboxConfig,
         backend_config: Option<&BackendConfig>,
         image_defaults: Option<SandboxConfigPatch>,
+        normalize_options: impl FnOnce(&mut SandboxConfigPatch),
     ) -> MicrosandboxResult<SandboxConfig> {
         let mut caller_config_overrides = SandboxConfigPatch {
             spec: self.config.spec.clone(),
@@ -1395,7 +1405,7 @@ impl SandboxBuilder {
             .and(captured.spec.image.as_ref())
             .and_then(RootfsSource::oci_root_disk)
             .cloned();
-        let options = if let Some(mut prepared) = prepared {
+        let mut options = if let Some(mut prepared) = prepared {
             // Inspection started from the caller's options and may have replaced captured
             // state. Do not overlay the old concrete values back onto that result.
             if rebuilt {
@@ -1409,6 +1419,9 @@ impl SandboxBuilder {
             std::mem::take(&mut self.config)
         };
 
+        normalize_options(&mut options);
+
+        let mut sandbox = SandboxConfig::default();
         sandbox.apply_layers(backend_config, options, image_defaults)?;
 
         if let Some(captured) = captured_root
