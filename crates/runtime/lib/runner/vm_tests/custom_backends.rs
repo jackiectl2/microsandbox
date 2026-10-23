@@ -170,6 +170,7 @@ fn build(config: &mut Config) -> RuntimeResult<VmBuildOutput> {
             numa_topology: None,
         },
         None,
+        &mut Vec::new(),
     )
 }
 

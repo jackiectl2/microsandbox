@@ -4438,7 +4438,7 @@ mod tests {
         };
         // An empty chain fails validate_upper_layers, which runs after the
         // flat-root branch created and registered the bootstrap trampoline.
-        let config = build_vm_test_config(scratch.path(), |vm| {
+        let mut config = build_vm_test_config(scratch.path(), |vm| {
             vm.rootfs_disk_spec = Some(UpperSpec {
                 layers: Vec::new(),
                 read_only: false,
@@ -4446,7 +4446,7 @@ mod tests {
         });
 
         let result = super::build_vm(
-            &config,
+            &mut config,
             super::AgentConsoleBackends {
                 control: crate::runner::console::AgentConsoleBackend::new(Arc::new(
                     ConsoleSharedState::new(),
@@ -4505,7 +4505,7 @@ mod tests {
         };
         std::fs::create_dir_all(scratch.path().join("runtime")).unwrap();
         std::fs::create_dir_all(scratch.path().join("runtime").join("scripts")).unwrap();
-        let config = build_vm_test_config(scratch.path(), |vm| {
+        let mut config = build_vm_test_config(scratch.path(), |vm| {
             vm.rootfs_vmdk = Some(scratch.path().join("rootfs.vmdk"));
             vm.rootfs_upper_spec = Some(UpperSpec {
                 layers: vec![UpperLayerSpec {
@@ -4517,7 +4517,7 @@ mod tests {
         });
 
         let result = super::build_vm(
-            &config,
+            &mut config,
             super::AgentConsoleBackends {
                 control: crate::runner::console::AgentConsoleBackend::new(Arc::new(
                     ConsoleSharedState::new(),
