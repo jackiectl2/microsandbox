@@ -239,7 +239,7 @@ impl LocalBackend {
         disk_only: bool,
         base: Option<&str>,
         choices: &crate::sandbox::restore_resources::RestoreResources,
-        boot_overrides: crate::sandbox::RestoreBootOverrides,
+        caller_overrides: Option<&crate::SandboxConfigPatch>,
     ) -> MicrosandboxResult<ArchiveChildMaterialization> {
         let total_started = Instant::now();
         tokio::fs::create_dir_all(child_stage).await?;
@@ -393,15 +393,16 @@ impl LocalBackend {
             ));
         }
 
-        boot_overrides.validate_scope(
-            manifest.scope,
-            if disk_only {
-                crate::sandbox::config::SnapshotRestoreMode::DiskOnly
-            } else {
-                crate::sandbox::config::SnapshotRestoreMode::Full
-            },
-        )?;
-
+        if let Some(caller_overrides) = caller_overrides {
+            caller_overrides.validate_for_restore(
+                manifest.scope,
+                if disk_only {
+                    crate::sandbox::config::SnapshotRestoreMode::DiskOnly
+                } else {
+                    crate::sandbox::config::SnapshotRestoreMode::Full
+                },
+            )?;
+        }
         delta::resolve(self, &inventory, child_stage, cache_stage.path(), base).await?;
 
         if let SnapshotState::Checkpoint(state) = &manifest.state {
@@ -6108,7 +6109,12 @@ mod tests {
                 false,
                 None,
                 &Default::default(),
-                crate::sandbox::RestoreBootOverrides { security: true },
+                Some(
+                    &crate::SandboxConfigPatch::new().spec(
+                        microsandbox_types::SandboxSpecPatch::new()
+                            .security_profile(microsandbox_types::SecurityProfile::Restricted),
+                    ),
+                ),
             )
             .await
             .err()
@@ -6135,7 +6141,12 @@ mod tests {
                 true,
                 None,
                 &Default::default(),
-                crate::sandbox::RestoreBootOverrides { security: true },
+                Some(
+                    &crate::SandboxConfigPatch::new().spec(
+                        microsandbox_types::SandboxSpecPatch::new()
+                            .security_profile(microsandbox_types::SecurityProfile::Restricted),
+                    ),
+                ),
             )
             .await
             .unwrap();

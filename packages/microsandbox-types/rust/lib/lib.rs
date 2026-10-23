@@ -2,6 +2,8 @@
 
 #![warn(missing_docs)]
 
+extern crate self as microsandbox_types;
+
 mod cloud;
 mod command;
 mod domain;

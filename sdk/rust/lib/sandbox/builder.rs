@@ -58,21 +58,23 @@ pub struct SandboxBuilder {
     /// Raw script snippets supplied through construction patches. They are materialized only when
     /// building so later shell overrides determine their shebang.
     config_scripts: BTreeMap<String, String>,
-    /// Snapshot restore progress: an explicit reference awaits backend resolution during async
-    /// `build()`, then becomes inspected state kept separate from the caller's sparse options.
-    restore: RestoreState,
+    /// Configuration baseline, kept separate from caller overrides. Snapshot references
+    /// are resolved during async `build()` before final layering.
+    config_source: ConfigSource,
 }
 
-/// Lifecycle of a snapshot restore flowing through the builder.
+/// Source of the configuration baseline used during final layering.
 #[derive(Default)]
-enum RestoreState {
-    /// No explicit restore source was supplied.
+enum ConfigSource {
+    /// Fresh creation using normal defaults, without an existing configuration baseline.
     #[default]
-    None,
+    Fresh,
     /// Reference awaiting backend resolution during async `build()`.
-    Pending(SnapshotReference),
-    /// Inspected snapshot state, kept separate from the caller's sparse options until finishing.
-    Prepared(Box<SandboxConfigPatch>),
+    Snapshot(SnapshotReference),
+    /// Resolved snapshot settings, kept separate from caller overrides until final layering.
+    ResolvedSnapshot(Box<SandboxConfigPatch>),
+    /// Resolved values from an earlier build, without inventing caller intent.
+    ExistingConfig(Box<SandboxConfigPatch>),
 }
 
 /// Sub-builder for registry connection settings.
@@ -136,7 +138,7 @@ impl SandboxBuilder {
             detached: false,
             build_error: None,
             config_scripts: BTreeMap::new(),
-            restore: RestoreState::default(),
+            config_source: ConfigSource::default(),
         }
     }
 
@@ -208,7 +210,7 @@ impl SandboxBuilder {
     /// Apply a CLI-selected image after discarding a lower-precedence configured snapshot.
     #[doc(hidden)]
     pub fn override_image(mut self, image: impl IntoImage) -> Self {
-        self.restore = RestoreState::None;
+        self.config_source = ConfigSource::Fresh;
         self.image(image)
     }
 
@@ -218,7 +220,7 @@ impl SandboxBuilder {
         mut self,
         configure: impl FnOnce(ImageBuilder) -> ImageBuilder,
     ) -> Self {
-        self.restore = RestoreState::None;
+        self.config_source = ConfigSource::Fresh;
         self.image_with(configure)
     }
 
@@ -227,7 +229,7 @@ impl SandboxBuilder {
     pub fn override_snapshot(mut self, snapshot: impl Into<String>) -> Self {
         self.config.spec.image = Some(RootfsSource::oci(""));
         self.config.local_restore_paths_resolved = Some(false);
-        self.restore = RestoreState::Pending(SnapshotReference::auto(snapshot));
+        self.config_source = ConfigSource::Snapshot(SnapshotReference::auto(snapshot));
         self
     }
 
@@ -1247,7 +1249,7 @@ impl SandboxBuilder {
         reference: impl Into<SnapshotReference>,
     ) -> Self {
         self.config.local_restore_paths_resolved = Some(false);
-        self.restore = RestoreState::Pending(reference.into());
+        self.config_source = ConfigSource::Snapshot(reference.into());
         self
     }
 
@@ -1342,9 +1344,19 @@ impl SandboxBuilder {
         backend_config: Option<&BackendConfig>,
         image_defaults: Option<SandboxConfigPatch>,
     ) -> MicrosandboxResult<SandboxConfig> {
-        // Inspect captured state before layering caller options and managed requirements.
-        let prepared = match std::mem::take(&mut self.restore) {
-            RestoreState::Prepared(prepared) => Some(*prepared),
+        let mut caller_config_overrides = SandboxConfigPatch {
+            spec: self.config.spec.clone(),
+            external_mount_policy: self.config.external_mount_policy,
+            ..Default::default()
+        };
+        let rebuilt = matches!(self.config_source, ConfigSource::ExistingConfig(_));
+        let restored = matches!(self.config_source, ConfigSource::ResolvedSnapshot(_));
+
+        // Inspect captured state before layering caller overrides and managed requirements.
+        let prepared = match std::mem::take(&mut self.config_source) {
+            ConfigSource::ResolvedSnapshot(prepared) | ConfigSource::ExistingConfig(prepared) => {
+                Some(*prepared)
+            }
             _ => None,
         };
         let captured = prepared.as_ref().unwrap_or(&self.config);
@@ -1357,8 +1369,12 @@ impl SandboxBuilder {
         let options = if let Some(mut prepared) = prepared {
             // Inspection started from the caller's options and may have replaced captured
             // state. Do not overlay the old concrete values back onto that result.
-            prepared.spec.resources = self.config.spec.resources.clone();
-            prepared.spec.deployment_profile = self.config.spec.deployment_profile;
+            if rebuilt {
+                prepared.overlay_mut(self.config.clone());
+            } else {
+                prepared.spec.resources = self.config.spec.resources.clone();
+                prepared.spec.deployment_profile = self.config.spec.deployment_profile;
+            }
             prepared
         } else {
             std::mem::take(&mut self.config)
@@ -1375,6 +1391,13 @@ impl SandboxBuilder {
                 "managed settings conflict with the snapshot's captured root disk layout".into(),
             ));
         }
+
+        // Destination bindings may have gained owned snapshot volumes during
+        // preparation. Replaying a partial caller list would drop those volumes.
+        if restored && caller_config_overrides.spec.mounts.is_some() {
+            caller_config_overrides.spec.mounts = Some(sandbox.spec.mounts.clone());
+        }
+        sandbox.caller_config_overrides = Some(Box::new(caller_config_overrides));
         self.materialize_config_scripts(&mut sandbox);
         self.validate(&mut sandbox)?;
 
@@ -1433,7 +1456,7 @@ impl SandboxBuilder {
         if backend.as_local().is_some() {
             let captured = self.config.local_restore_paths_resolved == Some(true);
             crate::backend::local::host_paths::resolve_patch_paths(&mut self.config)?;
-            if !captured && let RestoreState::Pending(reference) = &mut self.restore {
+            if !captured && let ConfigSource::Snapshot(reference) = &mut self.config_source {
                 crate::backend::local::host_paths::resolve_snapshot_reference(reference)?;
             }
         }
@@ -1455,8 +1478,15 @@ impl SandboxBuilder {
         #[cfg(feature = "local")]
         self.capture_host_paths(backend.as_ref())?;
         self.resolve_pending(backend).await?;
-        Ok(match &mut self.restore {
-            RestoreState::Prepared(prepared) => prepared,
+
+        if let ConfigSource::ExistingConfig(prepared) = &mut self.config_source {
+            prepared.overlay_mut(self.config.clone());
+        }
+
+        Ok(match &mut self.config_source {
+            ConfigSource::ResolvedSnapshot(prepared) | ConfigSource::ExistingConfig(prepared) => {
+                prepared
+            }
             _ => &mut self.config,
         })
     }
@@ -1469,10 +1499,10 @@ impl SandboxBuilder {
         &mut self,
         backend: std::sync::Arc<dyn crate::Backend>,
     ) -> MicrosandboxResult<()> {
-        let pending = match std::mem::take(&mut self.restore) {
-            RestoreState::Pending(reference) => Some(reference),
+        let pending = match std::mem::take(&mut self.config_source) {
+            ConfigSource::Snapshot(reference) => Some(reference),
             other => {
-                self.restore = other;
+                self.config_source = other;
                 None
             }
         };
@@ -1512,16 +1542,21 @@ impl SandboxBuilder {
             self.config.snapshot_archive_source = None;
         }
 
+        let input = match &self.config_source {
+            ConfigSource::ExistingConfig(resolved) => {
+                (**resolved).clone().overlay(self.config.clone())
+            }
+            _ => self.config.clone(),
+        };
+
         let mut inspection = match BackendConfig::for_backend(backend.as_ref()) {
-            Some(backend) => backend
-                .sandbox_layers()
-                .options(self.config.clone())
-                .build(),
-            None => self.config.clone(),
+            Some(backend) => backend.sandbox_layers().options(input.clone()).build(),
+            None => input,
         };
 
         inspection.spec.resources = Default::default();
         inspection.apply_to(&mut config);
+        config.caller_config_overrides = Some(Box::new(self.config.clone()));
         config.snapshot_reference = snapshot_ref.clone();
         if snapshot_ref.is_some() {
             config.clear_prepared_restore();
@@ -1554,8 +1589,9 @@ impl SandboxBuilder {
 
         // Carry only prepared state forward. The original caller patch remains on the builder.
         self.config.snapshot_reference = None;
+        self.config.restore_resources = None;
         let prepared = SandboxConfigPatch::from_present_fields(config);
-        self.restore = RestoreState::Prepared(Box::new(prepared));
+        self.config_source = ConfigSource::ResolvedSnapshot(Box::new(prepared));
 
         Ok(())
     }
@@ -1641,7 +1677,7 @@ impl SandboxBuilder {
         let (handle, sender) = crate::progress::channel();
         self.config.creation_progress = Some(sender.downgrade());
         let task = tokio::spawn(crate::backend::with_backend(backend, async move {
-            if matches!(self.restore, RestoreState::Pending(_)) {
+            if matches!(self.config_source, ConfigSource::Snapshot(_)) {
                 let _ = sender.try_send(crate::CreationProgress::Startup(
                     crate::StartupProgress::phase(crate::StartupPhase::PreparingSnapshot),
                 ));
@@ -2079,9 +2115,7 @@ pub(crate) fn prepare_local_snapshot_restore(
 ) -> MicrosandboxResult<()> {
     // A security profile is a boot-time guest policy, not a host-side restore override.
     // Validate the caller's explicit intent before preparing any snapshot resources.
-    config
-        .restore_boot_overrides
-        .validate_scope(snap.manifest().scope, config.snapshot_restore_mode)?;
+    config.validate_restore_options(snap.manifest().scope, config.snapshot_restore_mode)?;
     if config.spec.runtime.user.is_none() {
         config.spec.runtime.user = snap.manifest().restore_defaults()?.user;
     }
@@ -2272,7 +2306,7 @@ pub(crate) fn apply_checkpoint_restore_constraints(
     checkpoint: &microsandbox_image::checkpoint::CheckpointManifest,
 ) -> MicrosandboxResult<()> {
     // Both installed snapshots and archives must reject unsupported boot policy changes.
-    config.restore_boot_overrides.validate_scope(
+    config.validate_restore_options(
         crate::snapshot::SnapshotScope::Full,
         config.snapshot_restore_mode,
     )?;
@@ -2428,8 +2462,13 @@ fn wrap_config_script(shell: Option<&str>, body: &str) -> String {
 // Trait Implementations
 //--------------------------------------------------------------------------------------------------
 
+/// Start from an existing config while keeping track of what the caller explicitly set.
+/// Use builder setters or `overlay` for edits; changing resolved fields directly does not
+/// update the recorded overrides, which can take precedence over those edits.
 impl From<SandboxConfig> for SandboxBuilder {
     fn from(mut config: SandboxConfig) -> Self {
+        let saved_overrides = config.caller_config_overrides.take();
+        let workdir = config.spec.runtime.workdir.clone();
         let env = std::mem::take(&mut config.spec.env);
         let shell = config.spec.runtime.shell.take();
         let log_level = config.spec.runtime.log_level.take();
@@ -2440,13 +2479,27 @@ impl From<SandboxConfig> for SandboxBuilder {
         patch.spec.runtime.shell = Some(shell);
         patch.spec.runtime.log_level = Some(log_level);
         patch.spec.runtime.metrics_sample_interval_ms = Some(metrics_sample_interval_ms);
+        if saved_overrides
+            .as_ref()
+            .is_some_and(|caller_overrides| caller_overrides.spec.runtime.workdir.is_some())
+        {
+            patch.spec.runtime.workdir = Some(workdir);
+        }
+
+        let mut caller_overrides = patch.clone();
+        caller_overrides.spec = saved_overrides
+            .map(|caller_overrides| caller_overrides.spec)
+            .unwrap_or_default();
+        // Keep this sandbox's name and temporary operation state, rather than replaying old ones.
+        caller_overrides.spec.name = patch.spec.name.clone();
+        caller_overrides.caller_config_overrides = None;
 
         Self {
-            config: patch,
+            config: caller_overrides,
             detached: false,
             build_error: None,
             config_scripts: BTreeMap::new(),
-            restore: RestoreState::default(),
+            config_source: ConfigSource::ExistingConfig(Box::new(patch)),
         }
     }
 }
@@ -2458,7 +2511,7 @@ impl From<SandboxConfig> for SandboxBuilder {
 #[cfg(all(test, feature = "local"))]
 mod tests {
     use super::{
-        BackendConfig, RestoreState, SandboxBuilder, SandboxConfig, SandboxConfigPatch,
+        BackendConfig, ConfigSource, SandboxBuilder, SandboxConfig, SandboxConfigPatch,
         checkpoint_network_override_conflicts,
     };
     use crate::config::GlobalConfigPatch;
@@ -2467,6 +2520,52 @@ mod tests {
     use crate::sandbox::{MAX_HOSTNAME_BYTES, MAX_SANDBOX_NAME_BYTES, RlimitResource};
     use crate::{LogLevel, MicrosandboxError, MicrosandboxResult, RestoreKind};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn restored_bindings_survive_persistence_and_rebuild() {
+        let backend = BackendConfig::new(Default::default(), Default::default());
+        for explicit_mount in [false, true] {
+            let mut restore = crate::Sandbox::restore("saved").name("child");
+            if explicit_mount {
+                restore = restore.volume("/extra", |v| v.tmpfs());
+            }
+            let mut prepared = SandboxBuilder::new("child")
+                .image("alpine")
+                .env("CAPTURED", "value")
+                .volume("/data", |v| v.tmpfs())
+                .port(18080, 80)
+                .config
+                .into_config();
+            prepared
+                .spec
+                .mounts
+                .extend(restore.inner.config.clone().into_config().spec.mounts);
+            let restored =
+                finish_prepared_restore(prepared, restore.inner.config, &backend).unwrap();
+            let json = serde_json::to_string(&restored).unwrap();
+            let overrides = restored.caller_config_overrides_json(&json).unwrap();
+            let loaded = SandboxConfig::from_stored(&json, overrides.as_deref()).unwrap();
+            let rebuilt = SandboxBuilder::from(loaded).finish(None, None).unwrap();
+
+            assert_eq!(rebuilt.spec.env, restored.spec.env);
+            let mut guests: Vec<_> = rebuilt
+                .spec
+                .mounts
+                .iter()
+                .map(|mount| mount.guest())
+                .collect();
+            guests.sort_unstable();
+            assert_eq!(
+                guests,
+                if explicit_mount {
+                    vec!["/data", "/extra"]
+                } else {
+                    vec!["/data"]
+                }
+            );
+            assert_eq!(rebuilt.spec.network.ports.len(), 1);
+        }
+    }
 
     #[cfg(feature = "net")]
     #[test]
@@ -2519,7 +2618,7 @@ mod tests {
         let prepared = SandboxConfigPatch::from_present_fields(config);
         let mut builder = SandboxBuilder::new("");
         builder.config = caller;
-        builder.restore = RestoreState::Prepared(Box::new(prepared));
+        builder.config_source = ConfigSource::ResolvedSnapshot(Box::new(prepared));
         builder.finish_local(backend, None)
     }
 
@@ -2793,7 +2892,7 @@ mod tests {
     }
 
     #[test]
-    fn concrete_workdir_uses_normal_precedence() {
+    fn rebuilt_workdir_preserves_explicit_clear_and_managed_precedence() {
         let image = microsandbox_image::ImageConfig {
             working_dir: Some("/image".into()),
             ..Default::default()
@@ -2811,21 +2910,13 @@ mod tests {
         assert_eq!(built.spec.runtime.workdir, None);
 
         for (global, image, expected) in [
-            (
-                "{}",
-                Some(SandboxConfigPatch::from_image(&image)),
-                Some("/image"),
-            ),
+            ("{}", Some(SandboxConfigPatch::from_image(&image)), None),
             (
                 r#"{"sandbox_defaults":{"workdir":"/global"}}"#,
                 Some(SandboxConfigPatch::from_image(&image)),
-                Some("/global"),
-            ),
-            (
-                r#"{"sandbox_defaults":{"workdir":"/global"}}"#,
                 None,
-                Some("/global"),
             ),
+            (r#"{"sandbox_defaults":{"workdir":"/global"}}"#, None, None),
             (
                 r#"{"sandbox_defaults":{"workdir":null}}"#,
                 Some(SandboxConfigPatch::from_image(&image)),
@@ -2844,9 +2935,8 @@ mod tests {
             serde_json::from_str(r#"{"sandbox_defaults":{"workdir":"/global"}}"#).unwrap(),
             Default::default(),
         );
-        let mut supplied = built.clone();
-        supplied.spec.runtime.workdir = Some("/request".into());
-        let explicit = SandboxBuilder::from(supplied)
+        let explicit = SandboxBuilder::from(built.clone())
+            .workdir("/request")
             .finish(Some(&layers), Some(SandboxConfigPatch::from_image(&image)))
             .unwrap();
         assert_eq!(explicit.spec.runtime.workdir.as_deref(), Some("/request"));
@@ -4154,7 +4244,7 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_restore_resolves_sparse_resources_and_explicit_concrete_configs() {
+    fn checkpoint_restore_preserves_sparse_resource_intent_across_rebuilds() {
         use crate::sandbox::restore_resources::RestoreResources;
         use microsandbox_image::checkpoint::CheckpointGeometry;
 
@@ -4177,23 +4267,15 @@ mod tests {
             .memory_mib(2048)
             .max_memory_mib(4096);
         let cases = [
-            (SandboxResourcesPatch::new(), true, false),
-            (SandboxResourcesPatch::new().cpus(4), true, false),
-            (SandboxResourcesPatch::new().cpus(2), false, false),
-            (SandboxResourcesPatch::new().max_cpus(8), true, false),
-            (SandboxResourcesPatch::new().max_cpus(4), false, false),
-            (SandboxResourcesPatch::new().memory_mib(2048), true, false),
-            (SandboxResourcesPatch::new().memory_mib(512), false, false),
-            (
-                SandboxResourcesPatch::new().max_memory_mib(4096),
-                true,
-                false,
-            ),
-            (
-                SandboxResourcesPatch::new().max_memory_mib(2048),
-                false,
-                false,
-            ),
+            (SandboxResourcesPatch::new(), true),
+            (SandboxResourcesPatch::new().cpus(4), true),
+            (SandboxResourcesPatch::new().cpus(2), false),
+            (SandboxResourcesPatch::new().max_cpus(8), true),
+            (SandboxResourcesPatch::new().max_cpus(4), false),
+            (SandboxResourcesPatch::new().memory_mib(2048), true),
+            (SandboxResourcesPatch::new().memory_mib(512), false),
+            (SandboxResourcesPatch::new().max_memory_mib(4096), true),
+            (SandboxResourcesPatch::new().max_memory_mib(2048), false),
             (
                 SandboxResourcesPatch::new()
                     .cpus(2)
@@ -4201,11 +4283,10 @@ mod tests {
                     .memory_mib(512)
                     .clear_memory_mib(),
                 true,
-                false,
             ),
-            (matching.clone(), true, true),
+            (matching.clone(), true),
         ];
-        for (patch, sparse_accepted, concrete_accepted) in cases {
+        for (patch, sparse_accepted) in cases {
             for reuse in [false, true] {
                 let builder = SandboxBuilder::new("restore").image("alpine").overlay(
                     SandboxConfigPatch::new()
@@ -4216,7 +4297,7 @@ mod tests {
                 } else {
                     builder
                 };
-                builder.restore = RestoreState::Prepared(Box::new(
+                builder.config_source = ConfigSource::ResolvedSnapshot(Box::new(
                     SandboxConfigPatch::new()
                         .spec(
                             SandboxSpecPatch::new()
@@ -4229,11 +4310,8 @@ mod tests {
                         }),
                 ));
                 let result = builder.finish(Some(&sources), None);
-                let accepted = if reuse {
-                    concrete_accepted
-                } else {
-                    sparse_accepted
-                };
+                // Rebuilds retain sparse resource intent rather than inventing populated overrides.
+                let accepted = sparse_accepted;
                 assert_eq!(
                     result.is_ok(),
                     accepted,
@@ -4289,16 +4367,14 @@ mod tests {
             (4, 2048)
         );
 
-        // Direct edits and setters after conversion remain explicit, too.
+        // Builder edits after conversion remain explicit.
         let config = SandboxBuilder::new("restore")
             .image("alpine")
             .overlay(SandboxConfigPatch::new().spec(SandboxSpecPatch::new().resources(matching)))
             .finish(Some(&sources), None)
             .unwrap();
-        let mut edited = config.clone();
-        edited.spec.resources.memory_mib = 512;
         for mut builder in [
-            SandboxBuilder::from(edited),
+            SandboxBuilder::from(config.clone()).memory(512),
             SandboxBuilder::from(config).cpus(2),
         ] {
             builder.config.restore_resources = Some(RestoreResources {

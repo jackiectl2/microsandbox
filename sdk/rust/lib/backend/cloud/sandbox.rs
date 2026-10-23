@@ -1348,7 +1348,9 @@ mod tests {
         config.spec.resources.memory_mib = 1024;
         config.spec.resources.max_memory_mib = 1024;
         config.spec.security_profile = microsandbox_types::SecurityProfile::Restricted;
-        config.restore_boot_overrides.security = true;
+        let mut options = crate::SandboxConfigPatch::new();
+        options.spec.security_profile = Some(config.spec.security_profile);
+        config.caller_config_overrides = Some(Box::new(options));
         config.spec.lifecycle.max_duration_secs = Some(60);
         config.spec.lifecycle.idle_timeout_secs = Some(10);
 
