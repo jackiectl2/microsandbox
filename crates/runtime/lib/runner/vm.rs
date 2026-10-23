@@ -3912,13 +3912,13 @@ mod tests {
     #[cfg(unix)]
     use super::{
         BOOTSTRAP_ROOTFS_DIR, BindIdentityMapRegistration, PARENT_WATCH_DETACH,
-        ParentWatchdogSignal, bind_identity_map_for_mount, bootstrap_trampoline_backend,
-        read_parent_watchdog_signal, trampoline_rootfs_cleanup_on_exit,
+        ParentWatchdogSignal, TrampolineRootfsGuard, bind_identity_map_for_mount,
+        bootstrap_trampoline_backend, read_parent_watchdog_signal, remove_trampoline_rootfs_dirs,
+        trampoline_rootfs_cleanup_on_exit,
     };
     use super::{
-        DiskMountSpec, TrampolineRootfsGuard, UpperLayerSpec, UpperSpec,
-        prepare_runtime_restore_namespace, recover_owned_disk_layers,
-        remove_trampoline_rootfs_dirs, validate_disk_mount_layers, validate_upper_layers,
+        DiskMountSpec, UpperLayerSpec, UpperSpec, prepare_runtime_restore_namespace,
+        recover_owned_disk_layers, validate_disk_mount_layers, validate_upper_layers,
     };
 
     use microsandbox_filesystem::{Context, DynFileSystem, FsOptions};
