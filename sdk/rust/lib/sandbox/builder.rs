@@ -821,11 +821,7 @@ impl SandboxBuilder {
         guest_port: u16,
         protocol: PortProtocol,
     ) {
-        self.config
-            .spec
-            .network
-            .ports
-            .get_or_insert_default()
+        self.list_for_append(|config| &mut config.spec.network.ports)
             .push(PublishedPortSpec {
                 host_port,
                 guest_port,
@@ -865,11 +861,7 @@ impl SandboxBuilder {
     /// Guest applications connect directly to host CID 2 and `port`. No
     /// in-guest proxy or agentd integration is required.
     pub fn vsock(mut self, host_path: impl AsRef<Path>, port: u32) -> Self {
-        self.config
-            .spec
-            .vsock
-            .routes
-            .get_or_insert_default()
+        self.list_for_append(|config| &mut config.spec.vsock.routes)
             .push(VsockRouteSpec {
                 host_socket: host_path.as_ref().to_path_buf(),
                 port,
@@ -884,11 +876,7 @@ impl SandboxBuilder {
     /// best-effort, matching Unix and vsock datagram semantics. Windows does
     /// not support datagram routes.
     pub fn vsock_dgram(mut self, host_path: impl AsRef<Path>, port: u32) -> Self {
-        self.config
-            .spec
-            .vsock
-            .routes
-            .get_or_insert_default()
+        self.list_for_append(|config| &mut config.spec.vsock.routes)
             .push(VsockRouteSpec {
                 host_socket: host_path.as_ref().to_path_buf(),
                 port,
@@ -899,11 +887,7 @@ impl SandboxBuilder {
 
     /// Add a fully specified guest-to-host vsock route.
     pub fn vsock_route(mut self, route: VsockRouteSpec) -> Self {
-        self.config
-            .spec
-            .vsock
-            .routes
-            .get_or_insert_default()
+        self.list_for_append(|config| &mut config.spec.vsock.routes)
             .push(route);
         self
     }
@@ -1059,10 +1043,7 @@ impl SandboxBuilder {
     /// long-lived daemons inherit the raised baseline without needing explicit
     /// per-exec rlimits.
     pub fn rlimit(mut self, resource: RlimitResource, limit: u64) -> Self {
-        self.config
-            .spec
-            .rlimits
-            .get_or_insert_default()
+        self.list_for_append(|config| &mut config.spec.rlimits)
             .push(Rlimit {
                 resource,
                 soft: limit,
@@ -1073,10 +1054,7 @@ impl SandboxBuilder {
 
     /// Set a sandbox-wide resource limit with different soft/hard values.
     pub fn rlimit_range(mut self, resource: RlimitResource, soft: u64, hard: u64) -> Self {
-        self.config
-            .spec
-            .rlimits
-            .get_or_insert_default()
+        self.list_for_append(|config| &mut config.spec.rlimits)
             .push(Rlimit {
                 resource,
                 soft,
@@ -1175,7 +1153,8 @@ impl SandboxBuilder {
     ) -> Self {
         match f(MountBuilder::new(guest_path)).build() {
             Ok(mount) => {
-                self.config.spec.mounts.get_or_insert_default().push(mount);
+                self.list_for_append(|config| &mut config.spec.mounts)
+                    .push(mount);
             }
             Err(e) => {
                 if self.build_error.is_none() {
@@ -1200,25 +1179,38 @@ impl SandboxBuilder {
     /// )
     /// ```
     pub fn patch(mut self, f: impl FnOnce(PatchBuilder) -> PatchBuilder) -> Self {
-        self.config
-            .spec
-            .patches
-            .get_or_insert_default()
+        self.list_for_append(|config| &mut config.spec.patches)
             .extend(f(PatchBuilder::new()).build());
         self
     }
 
     /// Add a single patch directly.
     pub fn add_patch(mut self, patch: Patch) -> Self {
-        self.config.spec.patches.get_or_insert_default().push(patch);
+        self.list_for_append(|config| &mut config.spec.patches)
+            .push(patch);
         self
     }
 
     /// Add one already-materialized volume mount.
     #[doc(hidden)]
     pub fn add_volume_mount(mut self, mount: VolumeMount) -> Self {
-        self.config.spec.mounts.get_or_insert_default().push(mount);
+        self.list_for_append(|config| &mut config.spec.mounts)
+            .push(mount);
         self
+    }
+
+    /// Start an additive edit from the existing list unless the caller already replaced it.
+    fn list_for_append<T: Clone>(
+        &mut self,
+        select: fn(&mut SandboxConfigPatch) -> &mut Option<Vec<T>>,
+    ) -> &mut Vec<T> {
+        if select(&mut self.config).is_none()
+            && let ConfigSource::ExistingConfig(existing) = &mut self.config_source
+        {
+            *select(&mut self.config) = select(existing).clone();
+        }
+
+        select(&mut self.config).get_or_insert_default()
     }
 
     /// Cold-boot only the disk state carried by a full snapshot.
@@ -1409,6 +1401,9 @@ impl SandboxBuilder {
         &self,
     ) -> MicrosandboxResult<microsandbox_network::config::NetworkConfig> {
         let mut network = super::NetworkSpec::default();
+        if let ConfigSource::ExistingConfig(existing) = &self.config_source {
+            existing.spec.network.clone().apply_to(&mut network);
+        }
         self.config.spec.network.clone().apply_to(&mut network);
         super::config::network_config_from_spec(&network)
     }
@@ -2520,6 +2515,128 @@ mod tests {
     use crate::sandbox::{MAX_HOSTNAME_BYTES, MAX_SANDBOX_NAME_BYTES, RlimitResource};
     use crate::{LogLevel, MicrosandboxError, MicrosandboxResult, RestoreKind};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn additive_setters_preserve_existing_config_lists() {
+        for saved_state in ["legacy", "captured", "explicit"] {
+            let mut original = SandboxBuilder::new("existing")
+                .image("alpine")
+                .volume("/data", |v| v.tmpfs())
+                .port(18080, 80)
+                .vsock("/tmp/existing.sock", 9000)
+                .rlimit(RlimitResource::Nofile, 1024)
+                .patch(|p| p.text("/etc/original", "original", None, false))
+                .finish(None, None)
+                .unwrap();
+            original.caller_config_overrides = match saved_state {
+                "legacy" => None,
+                "captured" => Some(Box::new(SandboxConfigPatch::default())),
+                _ => original.caller_config_overrides,
+            };
+
+            let added = SandboxBuilder::new("added")
+                .image("alpine")
+                .volume("/extra", |v| v.tmpfs())
+                .port(18081, 81)
+                .vsock("/tmp/extra.sock", 9001)
+                .rlimit(RlimitResource::Core, 0)
+                .patch(|p| p.text("/etc/extra", "extra", None, false))
+                .finish(None, None)
+                .unwrap();
+            let rebuilt = SandboxBuilder::from(original.clone())
+                .add_volume_mount(added.spec.mounts[0].clone())
+                .port(18081, 81)
+                .vsock_route(added.spec.vsock.routes[0].clone())
+                .rlimit_range(RlimitResource::Core, 0, 0)
+                .add_patch(added.spec.patches[0].clone())
+                .finish(None, None)
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(&rebuilt.spec.mounts).unwrap(),
+                serde_json::to_value(
+                    [original.spec.mounts.clone(), added.spec.mounts.clone()].concat()
+                )
+                .unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(&rebuilt.spec.network.ports).unwrap(),
+                serde_json::to_value(
+                    [
+                        original.spec.network.ports.clone(),
+                        added.spec.network.ports.clone()
+                    ]
+                    .concat()
+                )
+                .unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(&rebuilt.spec.vsock.routes).unwrap(),
+                serde_json::to_value(
+                    [
+                        original.spec.vsock.routes.clone(),
+                        added.spec.vsock.routes.clone()
+                    ]
+                    .concat()
+                )
+                .unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(&rebuilt.spec.rlimits).unwrap(),
+                serde_json::to_value(
+                    [original.spec.rlimits.clone(), added.spec.rlimits.clone()].concat()
+                )
+                .unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(&rebuilt.spec.patches).unwrap(),
+                serde_json::to_value(
+                    [original.spec.patches.clone(), added.spec.patches.clone()].concat()
+                )
+                .unwrap()
+            );
+
+            let json = serde_json::to_string(&rebuilt).unwrap();
+            let overrides = rebuilt.caller_config_overrides_json(&json).unwrap();
+            let loaded = SandboxConfig::from_stored(&json, overrides.as_deref()).unwrap();
+            let again = SandboxBuilder::from(loaded).finish(None, None).unwrap();
+            assert_eq!(
+                serde_json::to_value(&again.spec).unwrap(),
+                serde_json::to_value(&rebuilt.spec).unwrap()
+            );
+
+            // An explicit clear must still replace the inherited list before an addition.
+            let mut clear = SandboxConfigPatch::default();
+            clear.spec.mounts = Some(Vec::new());
+            let replaced = SandboxBuilder::from(original)
+                .overlay(clear)
+                .volume("/extra", |v| v.tmpfs())
+                .finish(None, None)
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(&replaced.spec.mounts).unwrap(),
+                serde_json::to_value(&added.spec.mounts).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn network_edits_preserve_existing_config() {
+        let mut original = SandboxBuilder::new("existing")
+            .image("alpine")
+            .port(18080, 80)
+            .finish(None, None)
+            .unwrap();
+        original.caller_config_overrides = None;
+        let rebuilt = SandboxBuilder::from(original.clone())
+            .network(|n| n.port(18081, 81))
+            .finish(None, None)
+            .unwrap();
+        assert_eq!(rebuilt.spec.network.ports.len(), 2);
+        assert_eq!(
+            serde_json::to_value(&rebuilt.spec.network.ports[0]).unwrap(),
+            serde_json::to_value(&original.spec.network.ports[0]).unwrap()
+        );
+    }
 
     #[test]
     fn restored_bindings_survive_persistence_and_rebuild() {
