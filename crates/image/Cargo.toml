@@ -26,6 +26,7 @@ oci-spec.workspace = true
 rand.workspace = true
 rustls-pki-types.workspace = true
 scopeguard.workspace = true
+scc.workspace = true
 serde = { workspace = true, features = ["rc"] }
 serde_json.workspace = true
 sha2.workspace = true
@@ -40,3 +41,4 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Stora
 [dev-dependencies]
 rcgen.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
