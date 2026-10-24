@@ -1566,6 +1566,7 @@ pub(crate) fn build_exec_request(
         .collect();
 
     ExecRequest {
+        runtime_owned: false,
         cmd,
         args,
         env,

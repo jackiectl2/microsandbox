@@ -1755,6 +1755,7 @@ mod tests {
                 .await
                 .unwrap();
         let request = ExecRequest {
+            runtime_owned: false,
             cmd: "/bin/true".into(),
             args: Vec::new(),
             env: Vec::new(),
@@ -1971,6 +1972,7 @@ mod tests {
         assert!(client.supports(MessageType::ExecRequest));
 
         let request = ExecRequest {
+            runtime_owned: false,
             cmd: "echo".into(),
             args: vec!["hi".into()],
             env: Vec::new(),

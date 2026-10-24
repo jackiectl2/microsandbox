@@ -67,7 +67,7 @@ pub struct HeartbeatStatus {
     pub active_exec_sessions: u32,
 
     /// Number of exec sessions with an attached caller.
-    pub active_attached_exec_sessions: u32,
+    pub attached_exec_sessions: u32,
 
     /// Number of currently active filesystem stream sessions.
     pub active_fs_streams: u32,
@@ -88,7 +88,7 @@ struct HeartbeatSnapshot {
     activity_seq: u64,
     active_exec_sessions: u32,
     #[serde(default)]
-    active_attached_exec_sessions: Option<u32>,
+    attached_exec_sessions: Option<u32>,
     active_fs_streams: u32,
     active_tcp_streams: u32,
 }
@@ -148,7 +148,7 @@ impl HeartbeatReader {
         }
 
         // Detached jobs can run unattended; attached callers still keep the sandbox active.
-        if status.active_attached_exec_sessions > 0 {
+        if status.attached_exec_sessions > 0 {
             return HeartbeatDecision::Active(status);
         }
 
@@ -181,9 +181,8 @@ impl HeartbeatReader {
             heartbeat_seq: self.last_heartbeat_seq,
             activity_seq: self.last_activity_seq,
             active_exec_sessions: heartbeat.map_or(0, |hb| hb.active_exec_sessions),
-            active_attached_exec_sessions: heartbeat.map_or(0, |hb| {
-                hb.active_attached_exec_sessions
-                    .unwrap_or(hb.active_exec_sessions)
+            attached_exec_sessions: heartbeat.map_or(0, |hb| {
+                hb.attached_exec_sessions.unwrap_or(hb.active_exec_sessions)
             }),
             active_fs_streams: heartbeat.map_or(0, |hb| hb.active_fs_streams),
             active_tcp_streams: heartbeat.map_or(0, |hb| hb.active_tcp_streams),
@@ -309,7 +308,7 @@ mod tests {
 
         for (heartbeat_seq, now) in [(1, start), (2, start + Duration::from_secs(120))] {
             let mut snapshot = serde_json::to_value(heartbeat(heartbeat_seq, 1, 1)).unwrap();
-            snapshot["active_attached_exec_sessions"] = serde_json::json!(0);
+            snapshot["attached_exec_sessions"] = serde_json::json!(0);
             std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
 
             let decision = reader.check_at(now, Some(Duration::from_secs(60)));
@@ -321,7 +320,7 @@ mod tests {
         }
 
         let mut snapshot = serde_json::to_value(heartbeat(3, 2, 1)).unwrap();
-        snapshot["active_attached_exec_sessions"] = serde_json::json!(0);
+        snapshot["attached_exec_sessions"] = serde_json::json!(0);
         std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
         assert!(matches!(
             reader.check_at(
@@ -433,7 +432,7 @@ mod tests {
             timestamp: Utc::now(),
             last_activity: Utc::now(),
             active_exec_sessions,
-            active_attached_exec_sessions: None,
+            attached_exec_sessions: None,
             active_fs_streams: 0,
             active_tcp_streams: 0,
             activity_counters: ActivityCounters::default(),

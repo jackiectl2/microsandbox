@@ -24,6 +24,10 @@ pub const MAX_EXEC_CONTROL_BYTES: usize = 4096;
 /// Request to execute a command in the guest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecRequest {
+    /// Marks an execution managed by the host job manager, whose caller may detach.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub runtime_owned: bool,
+
     /// The command to execute (program path).
     pub cmd: String,
 
@@ -58,6 +62,10 @@ pub struct ExecRequest {
     /// POSIX resource limits to apply to the spawned process via `setrlimit()`.
     #[serde(default)]
     pub rlimits: Vec<ExecRlimit>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// A POSIX resource limit to apply to a spawned process.
@@ -304,7 +312,24 @@ impl FromStr for ExecRlimit {
 
 #[cfg(test)]
 mod tests {
-    use super::ExecRlimit;
+    use super::{ExecRequest, ExecRlimit};
+
+    #[test]
+    fn runtime_owned_exec_marker_is_optional_on_the_wire() {
+        let mut request: ExecRequest = serde_json::from_str(r#"{"cmd":"true"}"#).unwrap();
+        assert!(!request.runtime_owned);
+        assert!(
+            serde_json::to_value(&request)
+                .unwrap()
+                .get("runtime_owned")
+                .is_none()
+        );
+        request.runtime_owned = true;
+        assert_eq!(
+            serde_json::to_value(&request).unwrap()["runtime_owned"],
+            true
+        );
+    }
 
     #[test]
     fn test_exec_rlimit_from_str_uses_soft_for_hard_when_omitted() {

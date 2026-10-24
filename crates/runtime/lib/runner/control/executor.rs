@@ -60,6 +60,10 @@ struct DedupEntry {
 //--------------------------------------------------------------------------------------------------
 
 impl RuntimeControlExecutor {
+    pub(crate) fn jobs(&self) -> std::sync::Arc<crate::runner::jobs::JobManager> {
+        std::sync::Arc::clone(&self.jobs)
+    }
+
     /// Construct an executor and atomically publish a fresh runtime boot identity.
     // Construction binds the VM, guest channel, and host lifecycle resources once.
     #[allow(clippy::too_many_arguments)]

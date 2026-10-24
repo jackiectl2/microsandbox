@@ -232,6 +232,15 @@ impl JobManager {
             .any(|entry| entry.record.info.state.is_active())
     }
 
+    /// An unexpired caller lease on an active job keeps its sandbox resident.
+    pub(crate) fn has_active_attachments(&self) -> bool {
+        let now = Instant::now();
+        self.entries.lock().unwrap().values().any(|entry| {
+            entry.record.info.state.is_active()
+                && entry.attachments.values().any(|lease| lease.expires > now)
+        })
+    }
+
     /// Caller holds lifecycle admission, so Start cannot race a capture or resident pause.
     pub(crate) fn request(self: &Arc<Self>, request: JobRequest, running: bool) -> JobResponse {
         if let Some(error) = &self.initialization_error {
@@ -746,6 +755,8 @@ impl JobManager {
             let controller = ExecController::from_ready_body(client.ready().ready_bytes())
                 .map_err(|error| error.to_string())?
                 .ok_or("guest lacks managed execution control support")?;
+            let mut command = command;
+            command.runtime_owned = true;
             let stream = client
                 .stream(TypedMessage::new(MessageType::ExecRequest, &command))
                 .await
@@ -1126,6 +1137,48 @@ mod tests {
             JobResponse::Error { code, .. } => code,
             other => panic!("expected error, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn only_unexpired_attachments_on_active_jobs_hold_lifecycle() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = manager(directory.path());
+        let id = id(1);
+        let record = StoredJob {
+            info: JobInfo::starting(id.clone(), "boot-one".into(), &command(), false, now()),
+            fingerprint: String::new(),
+        };
+        manager.entries.lock().unwrap().insert(
+            id.clone(),
+            Entry {
+                record,
+                output: VecDeque::new(),
+                output_bytes: 0,
+                capture_error: None,
+                sequence: 0,
+                input: None,
+                control: None,
+                resize: None,
+                attachments: BTreeMap::new(),
+            },
+        );
+        assert!(!manager.has_active_attachments());
+        let mut entries = manager.entries.lock().unwrap();
+        let entry = entries.get_mut(&id).unwrap();
+        entry.attachments.insert(
+            "caller".into(),
+            Attachment {
+                read_only: true,
+                expires: Instant::now() + Duration::from_secs(30),
+            },
+        );
+        drop(entries);
+        assert!(manager.has_active_attachments());
+        let mut entries = manager.entries.lock().unwrap();
+        let entry = entries.get_mut(&id).unwrap();
+        entry.attachments.get_mut("caller").unwrap().expires = Instant::now();
+        drop(entries);
+        assert!(!manager.has_active_attachments());
     }
 
     #[tokio::test]

@@ -151,6 +151,7 @@ pub struct Ready {
 }
 
 pub struct ExecRequest {
+    pub runtime_owned: bool, // optional on the wire; default false
     pub cmd: String,
     pub args: Vec<String>,
     pub env: Vec<String>,

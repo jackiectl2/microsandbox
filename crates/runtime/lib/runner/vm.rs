@@ -1194,7 +1194,7 @@ fn run(
     // Serve every host-side control operation through one runtime-owned executor and endpoint.
     // Restore constructs the executor now but withholds both public endpoints until the guest has
     // crossed its VMGenID/workload activation barrier.
-    let restore_endpoint_publication = {
+    let (restore_endpoint_publication, managed_jobs) = {
         let control = vm.control_handle();
         #[cfg(feature = "net")]
         let secrets = _network_secrets_handle.clone();
@@ -1228,13 +1228,17 @@ fn run(
                 }
             },
         };
+        let managed_jobs = context.executor.jobs();
         if restored_agent.is_some() {
-            Some(RestoreEndpointPublication {
-                agent_sock_path: config.agent_sock_path.clone(),
-                socket_paths: socket_paths.clone(),
-                sandbox_name: config.sandbox_name.clone(),
-                control: context,
-            })
+            (
+                Some(RestoreEndpointPublication {
+                    agent_sock_path: config.agent_sock_path.clone(),
+                    socket_paths: socket_paths.clone(),
+                    sandbox_name: config.sandbox_name.clone(),
+                    control: context,
+                }),
+                managed_jobs,
+            )
         } else {
             if let Err(error) = publish_control_endpoint(
                 control_sock_path,
@@ -1248,7 +1252,7 @@ fn run(
                 let _ = socket_paths.remove_canonical_artifacts();
                 return Err(error);
             }
-            None
+            (None, managed_jobs)
         }
     };
 
@@ -1562,6 +1566,7 @@ fn run(
         let heartbeat_shutdown_flush_timeout = shutdown_flush_timeout;
         tokio_rt.spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(1));
+            let mut last_job_attachment = None;
             loop {
                 interval.tick().await;
                 if heartbeat_shared
@@ -1571,9 +1576,20 @@ fn run(
                     continue;
                 }
                 let decision = heartbeat_reader.check(idle_timeout);
+                if managed_jobs.has_active_attachments() {
+                    last_job_attachment = Some(std::time::Instant::now());
+                    continue;
+                }
 
                 match decision {
                     HeartbeatDecision::Idle(status) => {
+                        // A caller that just detached gets a full idle interval before
+                        // its still-running job can trigger shutdown.
+                        if let (Some(last), Some(timeout)) = (last_job_attachment, idle_timeout)
+                            && last.elapsed() < timeout
+                        {
+                            continue;
+                        }
                         let idle_secs = idle_timeout.map(|timeout| timeout.as_secs()).unwrap_or(0);
                         tracing::info!(
                             idle_secs,
@@ -1581,7 +1597,7 @@ fn run(
                             activity_seq = ?status.activity_seq,
                             idle_for = ?status.idle_for,
                             active_exec_sessions = status.active_exec_sessions,
-                            active_attached_exec_sessions = status.active_attached_exec_sessions,
+                            attached_exec_sessions = status.attached_exec_sessions,
                             active_fs_streams = status.active_fs_streams,
                             active_tcp_streams = status.active_tcp_streams,
                             "sandbox idle, requesting guest shutdown"
