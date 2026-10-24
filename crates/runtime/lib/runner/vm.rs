@@ -1581,6 +1581,7 @@ fn run(
                             activity_seq = ?status.activity_seq,
                             idle_for = ?status.idle_for,
                             active_exec_sessions = status.active_exec_sessions,
+                            active_attached_exec_sessions = status.active_attached_exec_sessions,
                             active_fs_streams = status.active_fs_streams,
                             active_tcp_streams = status.active_tcp_streams,
                             "sandbox idle, requesting guest shutdown"

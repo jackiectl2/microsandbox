@@ -215,6 +215,7 @@ pub struct BootConsoleState {
 struct HeartbeatSnapshot {
     activity_seq: u64,
     active_exec_sessions: u32,
+    active_attached_exec_sessions: u32,
     active_fs_streams: u32,
     active_tcp_streams: u32,
     counters: ActivityCounters,
@@ -3377,6 +3378,7 @@ fn spawn_heartbeat_thread(
                     timestamp,
                     last_activity,
                     active_exec_sessions: snapshot.active_exec_sessions,
+                    active_attached_exec_sessions: Some(snapshot.active_attached_exec_sessions),
                     active_fs_streams: snapshot.active_fs_streams,
                     active_tcp_streams: snapshot.active_tcp_streams,
                     activity_counters: snapshot.counters,
@@ -3394,6 +3396,7 @@ fn heartbeat_snapshot(state: &AgentState, activity: &ActivityTracker) -> Heartbe
     HeartbeatSnapshot {
         activity_seq: activity.activity_seq,
         active_exec_sessions: (state.sessions.len() + state.detached_sessions.len()) as u32,
+        active_attached_exec_sessions: state.sessions.len() as u32,
         active_fs_streams: state
             .read_sessions
             .len()

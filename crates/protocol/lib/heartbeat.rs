@@ -25,6 +25,10 @@ pub struct Heartbeat {
     /// Number of currently active exec sessions.
     pub active_exec_sessions: u32,
 
+    /// Number of exec sessions whose caller is still attached. Older guests omit this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_attached_exec_sessions: Option<u32>,
+
     /// Number of currently active filesystem stream sessions.
     pub active_fs_streams: u32,
 
