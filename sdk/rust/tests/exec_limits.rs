@@ -13,7 +13,6 @@ use tokio::time::timeout;
 
 fn request(command: &str) -> ExecRequest {
     ExecRequest {
-        runtime_owned: false,
         cmd: "sh".into(),
         args: vec!["-c".into(), command.into()],
         env: vec![],

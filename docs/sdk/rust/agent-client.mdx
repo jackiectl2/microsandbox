@@ -398,7 +398,6 @@ use microsandbox::protocol::{exec::ExecRequest, message::MessageType};
 
 let (id, mut rx) = client
     .stream(MessageType::ExecRequest, &ExecRequest {
-        runtime_owned: false,
         cmd: "echo".into(),
         args: vec!["hi".into()],
         env: Vec::new(),

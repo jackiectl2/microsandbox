@@ -22,7 +22,6 @@ async fn live_existing_agent_preserves_execution_streams_and_filesystem_requests
             std::env::var("MSB_AGENT_TEST_VERSION").unwrap()
         );
         let request = ExecRequest {
-            runtime_owned: false,
             cmd: "/bin/sh".into(),
             args: vec![
                 "-c".into(),

@@ -215,7 +215,6 @@ pub struct BootConsoleState {
 struct HeartbeatSnapshot {
     activity_seq: u64,
     active_exec_sessions: u32,
-    attached_exec_sessions: u32,
     active_fs_streams: u32,
     active_tcp_streams: u32,
     counters: ActivityCounters,
@@ -3378,7 +3377,6 @@ fn spawn_heartbeat_thread(
                     timestamp,
                     last_activity,
                     active_exec_sessions: snapshot.active_exec_sessions,
-                    attached_exec_sessions: Some(snapshot.attached_exec_sessions),
                     active_fs_streams: snapshot.active_fs_streams,
                     active_tcp_streams: snapshot.active_tcp_streams,
                     activity_counters: snapshot.counters,
@@ -3396,11 +3394,6 @@ fn heartbeat_snapshot(state: &AgentState, activity: &ActivityTracker) -> Heartbe
     HeartbeatSnapshot {
         activity_seq: activity.activity_seq,
         active_exec_sessions: (state.sessions.len() + state.detached_sessions.len()) as u32,
-        attached_exec_sessions: state
-            .sessions
-            .values()
-            .filter(|session| !session.is_runtime_owned())
-            .count() as u32,
         active_fs_streams: state
             .read_sessions
             .len()
@@ -5928,7 +5921,6 @@ mod tests {
             let mut workload = crate::workload::tests::fake_latch();
             workload.freeze("stdin-cut").unwrap();
             let request = ExecRequest {
-                runtime_owned: false,
                 cmd: "/bin/sh".into(),
                 args: vec![
                     "-c".into(),
@@ -6136,7 +6128,6 @@ mod tests {
                 default_env: Vec::new(),
             };
             let request = ExecRequest {
-                runtime_owned: false,
                 cmd: "/bin/sh".into(),
                 args: vec!["-c".into(), "printf retained".into()],
                 env: vec![],
@@ -6200,41 +6191,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn heartbeat_counts_only_caller_owned_exec_as_attached() {
-        let mut state = AgentState::default();
-        let (sender, _output) = SessionOutputSender::channel();
-        for (id, runtime_owned) in [(1, false), (2, true)] {
-            let request = ExecRequest {
-                runtime_owned,
-                cmd: "/bin/true".into(),
-                args: vec![],
-                env: vec![],
-                cwd: None,
-                user: None,
-                tty: false,
-                rows: 24,
-                cols: 80,
-                rlimits: vec![],
-            };
-            let session = ExecSession::spawn(
-                id,
-                &request,
-                sender.clone(),
-                None,
-                crate::config::SecurityProfile::Default,
-                None,
-                None,
-            )
-            .unwrap();
-            state.sessions.insert(id, session);
-        }
-
-        let snapshot = heartbeat_snapshot(&state, &ActivityTracker::new());
-        assert_eq!(snapshot.active_exec_sessions, 2);
-        assert_eq!(snapshot.attached_exec_sessions, 1);
-    }
-
-    #[tokio::test]
     async fn restore_detaches_piped_and_pty_workloads_without_killing_or_reusing_output() {
         for tty in [false, true] {
             let mut state = AgentState::default();
@@ -6253,7 +6209,6 @@ mod tests {
             )
             .unwrap();
             let request = |script: &str| ExecRequest {
-                runtime_owned: false,
                 cmd: "/bin/sh".into(),
                 args: vec!["-c".into(), script.into()],
                 env: vec![],
@@ -6575,7 +6530,6 @@ mod tests {
     #[test]
     fn scripts_dir_goes_on_the_last_path_entry() {
         let mut req = ExecRequest {
-            runtime_owned: false,
             cmd: "/bin/true".into(),
             args: vec![],
             env: vec!["PATH=/first".into(), "PATH=/last".into()],

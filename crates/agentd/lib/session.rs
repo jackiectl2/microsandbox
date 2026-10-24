@@ -143,9 +143,6 @@ fn exec_failed_from_io_error(err: &std::io::Error, cmd: &str, stage: &str) -> Ex
 /// via the `mpsc` channel provided at spawn time.
 #[derive(Debug)]
 pub struct ExecSession {
-    /// Host-managed jobs can outlive their caller attachment.
-    runtime_owned: bool,
-
     /// Stable identity for the spawned process registration.
     process_identity: ProcessIdentity,
 
@@ -685,10 +682,6 @@ impl RawActivity {
 }
 
 impl ExecSession {
-    pub(crate) fn is_runtime_owned(&self) -> bool {
-        self.runtime_owned
-    }
-
     /// Spawns a new exec session.
     ///
     /// If `req.tty` is true, uses a PTY. Otherwise, uses piped stdin/stdout/stderr.
@@ -1240,7 +1233,6 @@ impl ExecSession {
         ));
 
         Ok(Self {
-            runtime_owned: req.runtime_owned,
             process_identity,
             process_manager: Arc::clone(process_manager),
             pty_master: Some(pty_master),
@@ -1359,7 +1351,6 @@ impl ExecSession {
         ));
 
         Ok(Self {
-            runtime_owned: req.runtime_owned,
             process_identity,
             process_manager: Arc::clone(process_manager),
             pty_master: None,
@@ -2270,7 +2261,6 @@ mod tests {
 
         let (tx, mut rx) = SessionOutputSender::channel();
         let req = ExecRequest {
-            runtime_owned: false,
             cmd: "/bin/sh".to_string(),
             args: vec!["-c".to_string(), "sleep 30 & echo $!".to_string()],
             env: Vec::new(),
@@ -2415,7 +2405,6 @@ mod tests {
                 let _runtime = handle.enter();
                 let code = 20 + offset as i32;
                 let req = ExecRequest {
-                    runtime_owned: false,
                     cmd: "/bin/sh".to_string(),
                     args: vec!["-c".to_string(), format!("exit {code}")],
                     env: Vec::new(),
@@ -2513,7 +2502,6 @@ mod tests {
     async fn run_single_pipe_spawn(id: u32, code: i32) {
         let (tx, mut rx) = SessionOutputSender::channel();
         let req = ExecRequest {
-            runtime_owned: false,
             cmd: "/bin/sh".to_string(),
             args: vec!["-c".to_string(), format!("exit {code}")],
             env: Vec::new(),
@@ -2679,7 +2667,6 @@ mod tests {
             for profile in [SecurityProfile::Default, SecurityProfile::Restricted] {
                 let (tx, mut rx) = SessionOutputSender::channel();
                 let req = ExecRequest {
-                    runtime_owned: false,
                     cmd: std::env::current_exe().unwrap().to_str().unwrap().into(),
                     args: vec![
                         "--exact".into(),
@@ -2813,7 +2800,6 @@ mod tests {
     async fn test_pty_reader_drains_ready_fd() {
         let (tx, mut rx) = SessionOutputSender::channel();
         let req = ExecRequest {
-            runtime_owned: false,
             cmd: "/bin/sh".to_string(),
             args: vec![
                 "-c".to_string(),
@@ -2882,7 +2868,6 @@ mod tests {
     #[test]
     fn test_request_user_overrides_config_default() {
         let req = ExecRequest {
-            runtime_owned: false,
             cmd: "/bin/true".to_string(),
             args: Vec::new(),
             env: Vec::new(),
@@ -2901,7 +2886,6 @@ mod tests {
     #[test]
     fn test_config_default_user_used_when_request_has_none() {
         let req = ExecRequest {
-            runtime_owned: false,
             cmd: "/bin/true".to_string(),
             args: Vec::new(),
             env: Vec::new(),
@@ -2925,7 +2909,6 @@ mod tests {
     #[test]
     fn test_request_without_user_does_not_apply_user_switch() {
         let req = ExecRequest {
-            runtime_owned: false,
             cmd: "/bin/true".to_string(),
             args: Vec::new(),
             env: Vec::new(),
@@ -2950,7 +2933,6 @@ mod tests {
     #[test]
     fn test_default_home_dir_uses_resolved_user_home() {
         let req = ExecRequest {
-            runtime_owned: false,
             cmd: "/bin/true".to_string(),
             args: Vec::new(),
             env: Vec::new(),
@@ -2980,7 +2962,6 @@ mod tests {
     #[test]
     fn test_default_home_dir_uses_root_when_user_absent() {
         let req = ExecRequest {
-            runtime_owned: false,
             cmd: "/bin/true".to_string(),
             args: Vec::new(),
             env: Vec::new(),
@@ -3005,7 +2986,6 @@ mod tests {
     #[test]
     fn test_default_home_dir_respects_explicit_home_env() {
         let req = ExecRequest {
-            runtime_owned: false,
             cmd: "/bin/true".to_string(),
             args: Vec::new(),
             env: vec!["HOME=/tmp/custom".to_string()],
@@ -3034,7 +3014,6 @@ mod tests {
     async fn test_spawn_pipe_error_does_not_include_probe_details() {
         let (tx, _rx) = SessionOutputSender::channel();
         let req = ExecRequest {
-            runtime_owned: false,
             cmd: "/definitely/not/a/real/binary".to_string(),
             args: Vec::new(),
             env: Vec::new(),

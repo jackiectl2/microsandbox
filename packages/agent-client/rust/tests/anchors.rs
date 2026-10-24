@@ -40,7 +40,6 @@ async fn live_anchor_metadata_execution_and_unsupported_ping() {
         assert_eq!(error.kind, ErrorKind::UnsupportedOperation);
         assert_eq!(error.delivery, Delivery::NotSent);
         let request = ExecRequest {
-            runtime_owned: false,
             cmd: "/bin/sh".into(),
             args: vec![
                 "-c".into(),

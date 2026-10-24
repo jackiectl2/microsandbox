@@ -66,9 +66,6 @@ pub struct HeartbeatStatus {
     /// Number of currently active exec sessions.
     pub active_exec_sessions: u32,
 
-    /// Number of exec sessions with an attached caller.
-    pub attached_exec_sessions: u32,
-
     /// Number of currently active filesystem stream sessions.
     pub active_fs_streams: u32,
 
@@ -87,8 +84,6 @@ struct HeartbeatSnapshot {
     heartbeat_seq: u64,
     activity_seq: u64,
     active_exec_sessions: u32,
-    #[serde(default)]
-    attached_exec_sessions: Option<u32>,
     active_fs_streams: u32,
     active_tcp_streams: u32,
 }
@@ -147,11 +142,6 @@ impl HeartbeatReader {
             return HeartbeatDecision::PendingBoot(status);
         }
 
-        // Detached jobs can run unattended; attached callers still keep the sandbox active.
-        if status.attached_exec_sessions > 0 {
-            return HeartbeatDecision::Active(status);
-        }
-
         match (idle_timeout, status.idle_for) {
             (Some(idle_timeout), Some(idle_for)) if idle_for >= idle_timeout => {
                 HeartbeatDecision::Idle(status)
@@ -181,9 +171,6 @@ impl HeartbeatReader {
             heartbeat_seq: self.last_heartbeat_seq,
             activity_seq: self.last_activity_seq,
             active_exec_sessions: heartbeat.map_or(0, |hb| hb.active_exec_sessions),
-            attached_exec_sessions: heartbeat.map_or(0, |hb| {
-                hb.attached_exec_sessions.unwrap_or(hb.active_exec_sessions)
-            }),
             active_fs_streams: heartbeat.map_or(0, |hb| hb.active_fs_streams),
             active_tcp_streams: heartbeat.map_or(0, |hb| hb.active_tcp_streams),
             heartbeat_stale_for: self
@@ -254,29 +241,6 @@ mod tests {
     }
 
     #[test]
-    fn running_exec_prevents_idle_despite_stale_activity_sequence() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(HEARTBEAT_FILE);
-        let start = Instant::now();
-        let mut reader = HeartbeatReader::new_at(dir.path());
-
-        write_heartbeat_file(&path, heartbeat(1, 1, 1));
-        assert!(matches!(
-            reader.check_at(start, Some(Duration::from_secs(60))),
-            HeartbeatDecision::Active(_)
-        ));
-
-        write_heartbeat_file(&path, heartbeat(2, 1, 1));
-        assert!(matches!(
-            reader.check_at(
-                start + Duration::from_secs(120),
-                Some(Duration::from_secs(60))
-            ),
-            HeartbeatDecision::Active(_)
-        ));
-    }
-
-    #[test]
     fn no_exec_is_idle_when_activity_sequence_is_stale() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(HEARTBEAT_FILE);
@@ -307,9 +271,7 @@ mod tests {
         let mut reader = HeartbeatReader::new_at(dir.path());
 
         for (heartbeat_seq, now) in [(1, start), (2, start + Duration::from_secs(120))] {
-            let mut snapshot = serde_json::to_value(heartbeat(heartbeat_seq, 1, 1)).unwrap();
-            snapshot["attached_exec_sessions"] = serde_json::json!(0);
-            std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+            write_heartbeat_file(&path, heartbeat(heartbeat_seq, 1, 1));
 
             let decision = reader.check_at(now, Some(Duration::from_secs(60)));
             if heartbeat_seq == 1 {
@@ -319,9 +281,7 @@ mod tests {
             }
         }
 
-        let mut snapshot = serde_json::to_value(heartbeat(3, 2, 1)).unwrap();
-        snapshot["attached_exec_sessions"] = serde_json::json!(0);
-        std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        write_heartbeat_file(&path, heartbeat(3, 2, 1));
         assert!(matches!(
             reader.check_at(
                 start + Duration::from_secs(121),
@@ -347,32 +307,6 @@ mod tests {
         write_heartbeat_file(&path, heartbeat(2, 1, 0));
         assert!(matches!(
             reader.check_at(start + Duration::from_secs(120), None),
-            HeartbeatDecision::Active(_)
-        ));
-    }
-
-    #[test]
-    fn stale_heartbeat_with_running_exec_is_not_killed() {
-        // The original bug: a busy sandbox whose heartbeat goes stale (the file
-        // stops advancing) while exec sessions are active was killed. It must NOT
-        // be — a busy agent is a healthy agent.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(HEARTBEAT_FILE);
-        let start = Instant::now();
-        let mut reader = HeartbeatReader::new_at(dir.path());
-
-        write_heartbeat_file(&path, heartbeat(1, 1, 1));
-        assert!(matches!(
-            reader.check_at(start, Some(Duration::from_secs(60))),
-            HeartbeatDecision::Active(_)
-        ));
-
-        // No new heartbeat for a long time, but an exec session is still open.
-        assert!(matches!(
-            reader.check_at(
-                start + Duration::from_secs(3600),
-                Some(Duration::from_secs(60))
-            ),
             HeartbeatDecision::Active(_)
         ));
     }
@@ -432,7 +366,6 @@ mod tests {
             timestamp: Utc::now(),
             last_activity: Utc::now(),
             active_exec_sessions,
-            attached_exec_sessions: None,
             active_fs_streams: 0,
             active_tcp_streams: 0,
             activity_counters: ActivityCounters::default(),

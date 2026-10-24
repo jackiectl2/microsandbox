@@ -66,7 +66,6 @@ async fn restored_creation_progress_and_ignored_observer() {
             // A differing destination cap must not change actual admission after restore.
             assert!(captured.max_executions <= 8, "fixture must use a small cap");
             let request = ExecRequest {
-                runtime_owned: false,
                 cmd: "sleep".into(),
                 args: vec!["30".into()],
                 env: Vec::new(),
